@@ -663,13 +663,10 @@ export function registerDoctorCommand(program: Command): void {
             json: options.json,
             failurePayload: FAILURE_PAYLOAD,
             allowImplicitRoot: false,
-            // Doctor reads; it never authors, so it never needs a project
-            // scope. Gating `store-read` on `--store` meant that standing IN a
-            // migrated Store and typing `rasen doctor` refused with
-            // `project_scope_required` — a layout v2 Store resolves as a store
-            // aggregate, and a project intent rejects one. That is the single
-            // most likely invocation for the Store owner this migration just
-            // served, and it was the one form that reported nothing.
+            // Prefer aggregate reads even when standing inside a Store with
+            // no selector. The nearest-root adapter separately admits a
+            // resolver-confirmed standalone project read; Store answers and
+            // diagnostics keep this aggregate intent.
             ...(options.project === undefined ? { intent: 'store-read' as const } : {}),
             // Doctor is the surface that REPORTS a broken store declaration,
             // so it must not be stopped by one (design D4).

@@ -29,12 +29,49 @@ import { FileSystemUtils } from '../../src/utils/file-system.js';
 import { writeLastWarnedVersionPair } from '../../src/core/version-guard-state.js';
 import { isolatedGitEnv } from '../helpers/store-git.js';
 
+interface NearestRootAliasCase {
+  readonly scenario: string;
+  readonly startPath: (aliasPath: string) => string;
+}
+
+const nearestRootAliases: NearestRootAliasCase[] = [
+  {
+    scenario: 'keeps the nearest standalone capability through a symlink or junction alias',
+    startPath: (aliasPath) => aliasPath,
+  },
+];
+
+if (process.platform === 'win32') {
+  nearestRootAliases.push(
+    {
+      scenario: 'keeps the nearest standalone capability when an alias changes drive-letter case',
+      startPath: (aliasPath) => {
+        if (!/^[A-Za-z]:[\\/]/.test(aliasPath)) {
+          throw new Error('Drive-letter coverage requires a drive-qualified Windows temp directory');
+        }
+        return aliasPath.replace(/^[A-Za-z]/, (drive) =>
+          drive === drive.toUpperCase() ? drive.toLowerCase() : drive.toUpperCase()
+        );
+      },
+    },
+    {
+      scenario: 'keeps the nearest standalone capability through a forward-slash Windows alias',
+      startPath: (aliasPath) => aliasPath.replace(/\\/g, '/'),
+    },
+  );
+}
+
 describe('resolveOpenSpecRoot', () => {
   let tempDir: string;
   let globalDataDir: string;
-  let savedXdgDataHome: string | undefined;
 
   beforeEach(() => {
+    for (const key of Object.keys(process.env)) {
+      if (/^(GIT_|RASEN_)/i.test(key)) {
+        // Reuse one stub name when RASEN_HOME or RASEN_LANG has a Windows case alias.
+        vi.stubEnv(process.platform === 'win32' ? key.toUpperCase() : key, undefined);
+      }
+    }
     tempDir = fs.realpathSync.native(
       fs.mkdtempSync(path.join(os.tmpdir(), 'rasen-root-selection-'))
     );
@@ -42,8 +79,7 @@ describe('resolveOpenSpecRoot', () => {
     // Store calls below thread `globalDataDir`. Keep fallback registry and
     // configuration reads inside this fixture too, so an omitted override
     // cannot reach the developer's machine home.
-    savedXdgDataHome = process.env.XDG_DATA_HOME;
-    process.env.XDG_DATA_HOME = path.join(tempDir, 'xdg');
+    vi.stubEnv('XDG_DATA_HOME', path.join(tempDir, 'xdg'));
     const homeDir = mkdir('home');
     vi.stubEnv('HOME', homeDir);
     vi.stubEnv('USERPROFILE', homeDir);
@@ -53,11 +89,6 @@ describe('resolveOpenSpecRoot', () => {
   });
 
   afterEach(() => {
-    if (savedXdgDataHome === undefined) {
-      delete process.env.XDG_DATA_HOME;
-    } else {
-      process.env.XDG_DATA_HOME = savedXdgDataHome;
-    }
     vi.unstubAllEnvs();
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
@@ -281,6 +312,57 @@ describe('resolveOpenSpecRoot', () => {
         'project-design-docs': path.join(repoRoot, 'rasen', 'design-docs'),
       },
     });
+  });
+
+  it.each(nearestRootAliases)('$scenario', async ({ startPath }) => {
+    const repoRoot = mkdir('alias-app');
+    createOpenSpecRoot(repoRoot);
+    fs.writeFileSync(
+      path.join(repoRoot, 'rasen', 'config.yaml'),
+      'schema: spec-driven\nprojectId: alias-app\n'
+    );
+    const nested = mkdir('alias-app/rasen/specs/nested');
+    mkdir('alias-app/rasen/design-docs');
+    const changeId = 'alias-change';
+    const changeRoot = mkdir(`alias-app/rasen/changes/${changeId}`);
+    fs.writeFileSync(path.join(changeRoot, 'proposal.md'), 'Nearest alias planning.\n');
+    const aliasRoot = path.join(tempDir, 'alias-app-link');
+    fs.symlinkSync(repoRoot, aliasRoot, process.platform === 'win32' ? 'junction' : 'dir');
+    const aliasStartPath = startPath(path.join(aliasRoot, 'rasen', 'specs', 'nested'));
+
+    const native = await resolveOpenSpecRoot({ startPath: nested, globalDataDir });
+    const aliased = await resolveOpenSpecRoot({ startPath: aliasStartPath, globalDataDir });
+    const locations = [
+      { kind: 'active-changes', expectedPath: path.join(repoRoot, 'rasen', 'changes') },
+      { kind: 'archive-line', expectedPath: path.join(repoRoot, 'rasen', 'changes', 'archive') },
+      { kind: 'specs', expectedPath: path.join(repoRoot, 'rasen', 'specs') },
+      { kind: 'project-design-docs', expectedPath: path.join(repoRoot, 'rasen', 'design-docs') },
+    ] as const;
+
+    for (const root of [native, aliased]) {
+      expect(root.source).toBe('nearest');
+      expect(fs.realpathSync.native(root.path)).toBe(fs.realpathSync.native(repoRoot));
+      expect(root.planningScope?.kind).toBe('standalone');
+      const scope = root.scope;
+      if (scope?.kind !== 'project' || scope.ref.mode !== 'standalone') {
+        throw new Error('Nearest discovery lost its standalone project-read capability');
+      }
+      expect(scope.ref.projectId).toBe('alias-app');
+      expect(fs.realpathSync.native(scope.ref.projectRoot)).toBe(fs.realpathSync.native(repoRoot));
+      expect(root.planningScope?.ref).toEqual(scope.ref);
+
+      for (const { kind, expectedPath } of locations) {
+        const location = scope.locate({ kind }).absolutePath;
+        expect(path.isAbsolute(location)).toBe(true);
+        expect(location).toBe(path.normalize(location));
+        expect(fs.realpathSync.native(location)).toBe(fs.realpathSync.native(expectedPath));
+        expect(root.planningScope?.paths[kind]).toBe(location);
+      }
+      const change = await scope.openChange({ changeId });
+      expect(fs.realpathSync.native(change.location.absolutePath)).toBe(
+        fs.realpathSync.native(changeRoot)
+      );
+    }
   });
 
   it('ignores leftover workspace view state when a nearest root exists', async () => {
@@ -1030,6 +1112,12 @@ describe('resolveOpenSpecRoot', () => {
       writeStaleSkill(repoRoot, STALE_VERSION);
       const gitExecEnv = { ...process.env, ...isolatedGitEnv(tempDir) };
       execFileSync('git', ['init'], { cwd: repoRoot, env: gitExecEnv, stdio: 'ignore' });
+      const gitRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+        cwd: repoRoot,
+        env: gitExecEnv,
+        encoding: 'utf8',
+      }).trim();
+      expect(fs.realpathSync.native(gitRoot)).toBe(fs.realpathSync.native(repoRoot));
       execFileSync('git', ['add', '-A'], { cwd: repoRoot, env: gitExecEnv, stdio: 'ignore' });
       execFileSync('git', ['commit', '-m', 'initial'], {
         cwd: repoRoot,

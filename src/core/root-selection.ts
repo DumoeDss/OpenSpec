@@ -1056,7 +1056,26 @@ export async function resolveOpenSpecRoot(
     }
     const storeFact = declaresAmbientStoreFact(nearest);
     try {
-      const scoped = await resolveOpenSpecRootThroughPlanning(options);
+      const scoped = await resolveOpenSpecRootThroughPlanning(options).catch(async (error) => {
+        if (
+          options.intent !== 'store-read' ||
+          !standaloneMetadataAbsent ||
+          !isRootSelectionError(error) ||
+          error.diagnostic.code !== 'project_scope_required' ||
+          error.diagnostic.target !== 'intent'
+        ) {
+          throw error;
+        }
+        // An aggregate read can reject a healthy standalone project. Ask the
+        // resolver for that capability without reclassifying Store facts here.
+        // Store answers and failed project reads keep the original diagnostic.
+        const standalone = await resolveOpenSpecRootThroughPlanning({
+          ...options,
+          intent: 'project-read',
+        }).catch(() => undefined);
+        if (standalone?.planningScope?.kind !== 'standalone') throw error;
+        return standalone;
+      });
       const kind = scoped.planningScope?.kind;
       if (kind === 'store-project' || kind === 'store-aggregate') return scoped;
       if (kind === 'standalone' && standaloneMetadataAbsent) {

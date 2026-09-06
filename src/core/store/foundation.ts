@@ -268,6 +268,31 @@ function isFileNotFoundError(error: unknown): boolean {
   return isNodeErrorCode(error, 'ENOENT');
 }
 
+/**
+ * Confirms that ENOENT from a metadata read means the metadata is genuinely
+ * absent. POSIX reports a regular file occupying `.rasen-store` as ENOTDIR on
+ * the read itself; Windows reports that same shape as ENOENT
+ * (ERROR_PATH_NOT_FOUND), indistinguishable from a missing namespace. The
+ * errno alone therefore cannot be trusted: each supported namespace must be
+ * missing or be a directory. Returns the occupied namespace otherwise. Any
+ * other stat failure propagates, since it leaves the absence unconfirmed.
+ */
+async function findNonDirectoryMetadataNamespace(
+  storeRoot: string
+): Promise<string | null> {
+  for (const namespaceDir of [
+    getStoreMetadataDir(storeRoot),
+    getLegacyStoreMetadataDir(storeRoot),
+  ]) {
+    try {
+      if (!(await fs.stat(namespaceDir)).isDirectory()) return namespaceDir;
+    } catch (error) {
+      if (!isFileNotFoundError(error)) throw error;
+    }
+  }
+  return null;
+}
+
 function normalizeExistingPathForStorage(existingPath: string): string {
   return FileSystemUtils.canonicalizeExistingPath(existingPath);
 }
@@ -863,17 +888,29 @@ export async function probeStoreMetadataState(
   }
 }
 
+/**
+ * Reads a root's metadata, answering `null` only for genuinely absent
+ * metadata: neither supported namespace holds the file, and neither is
+ * occupied by something other than a directory. Everything else — a file that
+ * fails to parse, a read error, a non-directory namespace — propagates, so no
+ * consumer can mistake an unreadable Store declaration for "no Store here".
+ */
 export async function readOptionalStoreMetadataState(
   storeRoot: string
 ): Promise<StoreMetadataState | null> {
   try {
     return await readStoreMetadataState(storeRoot);
   } catch (error) {
-    if (isFileNotFoundError(error)) {
-      return null;
-    }
-
-    throw error;
+    if (!isFileNotFoundError(error)) throw error;
+    const occupied = await findNonDirectoryMetadataNamespace(storeRoot);
+    if (occupied === null) return null;
+    // The error POSIX raises for this shape on the read itself, so the
+    // platform that reports it as ENOENT surfaces the same failure.
+    const notADirectory = new Error(
+      `ENOTDIR: not a directory, open '${joinStorePath(occupied, STORE_METADATA_FILE_NAME)}'`
+    );
+    (notADirectory as NodeJS.ErrnoException).code = 'ENOTDIR';
+    throw notADirectory;
   }
 }
 

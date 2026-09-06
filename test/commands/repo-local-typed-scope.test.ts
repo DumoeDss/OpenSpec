@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { writeStoreMetadataState } from '../../src/core/store/foundation.js';
 import { snapshotDirectory } from '../helpers/fs-snapshot.js';
@@ -30,6 +30,12 @@ describe('repo-local typed scope discovery', () => {
   let env: NodeJS.ProcessEnv;
 
   beforeEach(() => {
+    for (const key of Object.keys(process.env)) {
+      if (/^(GIT_|RASEN_)/i.test(key)) {
+        // Reuse one stub name for Windows case aliases and explicit fixture settings.
+        vi.stubEnv(process.platform === 'win32' ? key.toUpperCase() : key, undefined);
+      }
+    }
     tempDir = fs.realpathSync.native(
       fs.mkdtempSync(path.join(os.tmpdir(), 'rasen-repo-local-scope-'))
     );
@@ -63,6 +69,11 @@ describe('repo-local typed scope discovery', () => {
         windowsHide: true,
       };
       execFileSync('git', ['init', '--initial-branch=main'], options);
+      const gitRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+        ...options,
+        encoding: 'utf8',
+      }).trim();
+      expect(fs.realpathSync.native(gitRoot)).toBe(fs.realpathSync.native(checkout));
       execFileSync(
         'git',
         ['commit', '--allow-empty', '-m', 'Seed standalone scope fixture'],
@@ -72,6 +83,7 @@ describe('repo-local typed scope discovery', () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     cleanupTempPath(tempDir);
   });
 
