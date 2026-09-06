@@ -49,6 +49,48 @@ describe('rasen doctor (3.6)', () => {
     return dir;
   }
 
+  it('exposes authoritative standalone scope without an active Change', async () => {
+    const projectRoot = mkdir('standalone-project');
+    createOpenSpecRoot(projectRoot);
+    const planningHome = path.join(projectRoot, 'rasen');
+    const cwd = path.join(planningHome, 'specs');
+    const fixtureEnv = { ...env, RASEN_SESSION_CONTEXT: '' };
+
+    const listed = await runCLI(['list', '--json'], { cwd, env: fixtureEnv });
+    expect(listed.exitCode).toBe(0);
+    const listing = parseJson(listed);
+    expect(listing.changes).toEqual([]);
+
+    const result = await runCLI(['doctor', '--json'], { cwd, env: fixtureEnv });
+    expect(result.exitCode).toBe(0);
+    const health = parseJson(result);
+    expect(health.root).toMatchObject({
+      path: projectRoot,
+      source: 'nearest',
+      healthy: true,
+      scope: {
+        kind: 'standalone',
+        intent: 'project-read',
+        source: 'nearest-standalone',
+        ref: { mode: 'standalone', projectRoot },
+        paths: {
+          'planning-checkout': projectRoot,
+          'project-home': planningHome,
+          'project-config': path.join(planningHome, 'config.yaml'),
+          'project-schemas': path.join(planningHome, 'schemas'),
+          'project-work': path.join(planningHome, 'work'),
+          specs: path.join(planningHome, 'specs'),
+          'project-design-docs': path.join(planningHome, 'design-docs'),
+          'active-changes': path.join(planningHome, 'changes'),
+          'archive-line': path.join(planningHome, 'changes', 'archive'),
+        },
+      },
+    });
+    expect(health.root.store_id).toBeUndefined();
+    expect(health.root.scope.ref).toEqual(listing.root.scope.ref);
+    expect(health.root.scope.paths).toEqual(listing.root.scope.paths);
+  });
+
   it('reports ok everywhere for a healthy store-backed root, all session shapes', async () => {
     // A resolvable reference.
     const upstream = path.join(tempDir, 'upstream-context');

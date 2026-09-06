@@ -9,6 +9,7 @@ import {
   STORE_METADATA_FILE_NAME,
   STORE_REGISTRY_FILE_NAME,
   STORES_DIR_NAME,
+  getLegacyStoreMetadataDir,
   getStoreMetadataDir,
   getStoreMetadataPath,
   getStoreRegistryPath,
@@ -397,12 +398,41 @@ local_path: /repos/acme
 
       await expect(readOptionalStoreMetadataState(storeRoot)).resolves.toBeNull();
 
-      fs.mkdirSync(path.dirname(getStoreMetadataPath(storeRoot)), { recursive: true });
+      // A namespace directory that lacks the file is the same genuine absence.
+      fs.mkdirSync(getStoreMetadataDir(storeRoot), { recursive: true });
+      await expect(readOptionalStoreMetadataState(storeRoot)).resolves.toBeNull();
+
       fs.writeFileSync(getStoreMetadataPath(storeRoot), 'version: nope\n');
 
       await expect(readOptionalStoreMetadataState(storeRoot)).rejects.toThrow(
         /Invalid store metadata state/u
       );
+    });
+
+    const occupiedNamespaces = [
+      {
+        scenario: 'a regular file at .rasen-store is an unreadable declaration, not absence',
+        namespaceDir: getStoreMetadataDir,
+      },
+      {
+        scenario: 'a regular file at .openspec-store is an unreadable declaration, not absence',
+        namespaceDir: getLegacyStoreMetadataDir,
+      },
+    ];
+
+    // POSIX reports a read through a regular file as ENOTDIR; Windows reports
+    // it as ENOENT, the very code a missing namespace produces. The optional
+    // reader must refuse to answer null on both: answering "no Store here" over
+    // an occupied namespace is what let a standalone scope attach to such a
+    // root on Windows.
+    it.each(occupiedNamespaces)('$scenario', async ({ namespaceDir }) => {
+      const storeRoot = path.join(tempDir, 'occupied-store');
+      fs.mkdirSync(storeRoot);
+      fs.writeFileSync(namespaceDir(storeRoot), 'not a directory\n');
+
+      await expect(readOptionalStoreMetadataState(storeRoot)).rejects.toMatchObject({
+        code: 'ENOTDIR',
+      });
     });
   });
 

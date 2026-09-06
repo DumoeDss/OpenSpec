@@ -1043,8 +1043,10 @@ export async function resolveOpenSpecRoot(
 
   const nearest = findQualifyingRootSync(options.startPath ?? process.cwd());
   if (nearest) {
+    let standaloneMetadataAbsent = false;
     try {
       const metadata = await readOptionalStoreMetadataState(nearest);
+      standaloneMetadataAbsent = metadata === null;
       if (metadata?.layoutVersion === 2) {
         return resolveOpenSpecRootThroughPlanning(options);
       }
@@ -1054,9 +1056,42 @@ export async function resolveOpenSpecRoot(
     }
     const storeFact = declaresAmbientStoreFact(nearest);
     try {
-      const scoped = await resolveOpenSpecRootThroughPlanning(options);
+      const scoped = await resolveOpenSpecRootThroughPlanning(options).catch(async (error) => {
+        if (
+          options.intent !== 'store-read' ||
+          !standaloneMetadataAbsent ||
+          !isRootSelectionError(error) ||
+          error.diagnostic.code !== 'project_scope_required' ||
+          error.diagnostic.target !== 'intent'
+        ) {
+          throw error;
+        }
+        // An aggregate read can reject a healthy standalone project. Ask the
+        // resolver for that capability without reclassifying Store facts here.
+        // Store answers and failed project reads keep the original diagnostic.
+        const standalone = await resolveOpenSpecRootThroughPlanning({
+          ...options,
+          intent: 'project-read',
+        }).catch(() => undefined);
+        if (standalone?.planningScope?.kind !== 'standalone') throw error;
+        return standalone;
+      });
       const kind = scoped.planningScope?.kind;
       if (kind === 'store-project' || kind === 'store-aggregate') return scoped;
+      if (kind === 'standalone' && standaloneMetadataAbsent) {
+        const compatibility = await resolveStandaloneOrLegacyRoot(options);
+        if (
+          compatibility.source === 'nearest' &&
+          compatibility.storeId === undefined &&
+          samePathForPlatform(compatibility.path, scoped.path)
+        ) {
+          // Keep compatibility notices and source without discarding typed
+          // locations. Store declarations stay scope-less for archive guards.
+          scoped.source = compatibility.source;
+          return scoped;
+        }
+        return compatibility;
+      }
       // `standalone` and `legacy-store` are POSITIVE answers, and the frozen
       // compatibility adapter below owns their established notices and
       // diagnostics; falling through is not a fail-open.
