@@ -214,7 +214,9 @@ export async function verifyArchiveV2Accounting(
       'Parsed Archive v2 record differs from the planned record.'
     );
   }
-  const actualEvidence = archiveV2EvidenceEntries(await hashArchiveEvidence(archivedDir));
+  const actualEvidence = archiveV2EvidenceEntries(
+    await hashArchiveEvidence(archivedDir, expected.record.evidence)
+  );
   if (JSON.stringify(actualEvidence) !== JSON.stringify(expected.record.evidence)) {
     throw recordError(
       'archive-v2-evidence-verify',

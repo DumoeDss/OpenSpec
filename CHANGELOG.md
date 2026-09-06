@@ -8,6 +8,14 @@
 
 ### Changed
 
+- **BREAKING (saved archive plans):** Archive payload and evidence now exclude regular `.DS_Store`, `Thumbs.db`, and `desktop.ini` files. Same-name directories and symlinks, meaningful hidden files, Git state, and ephemera keep their existing contracts. Historical plans that recorded these files as payload are explicitly refused with `archive_os_metadata_policy_incompatible`; historical accounting still verifies every recorded evidence digest.
+
+### Fixed
+
+- Archive now records the branch and working-tree state of the Git repository owning `rasen/`, including independent nested planning repositories. Saved-plan revalidation and recovery use the same repository without changing product `codeCommit` provenance or rewriting existing archive evidence.
+- Interrupted archive recovery now retains pre-existing dirty input inside the active Change in its Git comparison while excluding only the transaction's owned stage. Unchanged same-token retries succeed without accepting outside-owned clean/dirty drift.
+- OS metadata created after planning or inside an already-owned final archive no longer causes payload-staleness or false ownership failures. Cleanup stays limited to verified transaction-owned source and staging trees; metadata never grants ownership of an unrelated destination.
+
 ## 0.1.7
 
 ### Added

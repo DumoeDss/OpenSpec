@@ -13,6 +13,7 @@ import * as path from 'node:path';
 import { promisify } from 'node:util';
 
 import { evidenceDir } from './file-placement.js';
+import { isExcludedArchiveOsMetadata } from './archive-os-metadata.js';
 import { isConfirmedGitWorkTree } from './store/git.js';
 
 const execFileAsync = promisify(execFile);
@@ -136,9 +137,17 @@ async function sha256File(absPath: string): Promise<string> {
   }
 }
 
-export async function hashArchiveEvidence(archivedDir: string): Promise<EvidenceEntry[]> {
+export async function hashArchiveEvidence(
+  archivedDir: string,
+  recordedEvidence?: readonly EvidenceEntry[]
+): Promise<EvidenceEntry[]> {
   const root = evidenceDir(archivedDir);
   const entries: EvidenceEntry[] = [];
+  // Historical receipts retain their exact recorded metadata digests. New
+  // metadata is still excluded; no receipt or evidence bytes are rewritten.
+  const recordedPaths = recordedEvidence === undefined
+    ? undefined
+    : new Set(recordedEvidence.map(entry => entry.path));
 
   async function walk(directory: string, prefix: string): Promise<void> {
     let dirents: import('node:fs').Dirent[];
@@ -151,8 +160,14 @@ export async function hashArchiveEvidence(archivedDir: string): Promise<Evidence
     dirents.sort((left, right) => left.name.localeCompare(right.name));
     for (const dirent of dirents) {
       const absolute = path.join(directory, dirent.name);
+      const relative = prefix ? `${prefix}/${dirent.name}` : dirent.name;
+      const evidencePath = `evidence/${relative}`;
       let stat: import('node:fs').Stats;
       try {
+        if (
+          !recordedPaths?.has(evidencePath) &&
+          await isExcludedArchiveOsMetadata(directory, dirent, fs)
+        ) continue;
         stat = await fs.lstat(absolute);
       } catch (error) {
         throw new ArchiveAccountingError('evidence-lstat', absolute, error);
@@ -165,9 +180,8 @@ export async function hashArchiveEvidence(archivedDir: string): Promise<Evidence
         );
       }
       if (stat.isFile()) {
-        const relative = prefix ? `${prefix}/${dirent.name}` : dirent.name;
         entries.push({
-          path: `evidence/${relative}`,
+          path: evidencePath,
           sha256: await sha256File(absolute),
         });
       } else if (stat.isDirectory()) {
@@ -374,7 +388,7 @@ export async function verifyArchiveAccounting(
       new Error('Parsed ledger differs from planned accounting.')
     );
   }
-  const actualEvidence = await hashArchiveEvidence(archivedDir);
+  const actualEvidence = await hashArchiveEvidence(archivedDir, expected.evidence);
   if (JSON.stringify(actualEvidence) !== JSON.stringify(expected.evidence)) {
     throw new ArchiveAccountingError(
       'archive-json-evidence-verify',

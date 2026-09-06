@@ -41,8 +41,10 @@ import {
 import {
   applyArchive,
   defaultArchiveEngineAdapters,
+  fingerprintArchiveTree,
   hashArchivePlan,
   loadStoredArchivePlan,
+  persistArchivePlan,
 } from '../../../src/core/archive-engine.js';
 import { createNodeWorkspaceCoordination } from '../../../src/core/store/workspace/dependencies.js';
 import { lockIsHeld } from '../../../src/core/store/workspace/locks.js';
@@ -627,6 +629,49 @@ describe('revalidation invalidates rather than repairs', () => {
   afterEach(() => {
     f.cleanup();
   });
+
+  it('APPLY-PLAN reports legacy OS metadata policy incompatibility before source drift', async () => {
+    const bound = await f.bind({
+      projectId: PROJECT_A,
+      targetLineId: LINE_02,
+      changeId: 'legacy-os-metadata-authority',
+    });
+    f.write(path.join(bound.changeDir, '.DS_Store'), 'historically recorded metadata\n');
+    const plan = await f.finalization().plan(
+      f.planInput(bound, { outcome: 'abandoned', reason: 'Dropped.' })
+    );
+    expect(plan.applicable, JSON.stringify(plan.blockers)).toBe(true);
+    const { planHash: _planHash, ...withoutHash } = plan.archivePlan;
+    const legacyWithoutHash = {
+      ...withoutHash,
+      sourceFingerprint: await fingerprintArchiveTree(
+        bound.changeDir,
+        defaultArchiveEngineAdapters,
+        { excludeOsMetadata: false }
+      ),
+    };
+    const legacyPlan = {
+      ...legacyWithoutHash,
+      planHash: hashArchivePlan(legacyWithoutHash),
+    };
+    const token = await persistArchivePlan(legacyPlan, f.globalDataDir);
+    const stored = await loadStoredArchivePlan(token, f.globalDataDir);
+    const planPath = path.join(
+      f.globalDataDir, 'archive-transactions', stored.transactionId, 'plan.json'
+    );
+    const planBefore = fs.readFileSync(planPath);
+    const sourceBefore = hashTree(bound.changeDir);
+    const archiveBefore = hashTree(plan.destination);
+
+    // This is the production saved-plan surface: no caller-supplied token.
+    await expect(f.finalization().applyStoredPlan(stored)).rejects.toMatchObject({
+      code: 'archive_os_metadata_policy_incompatible',
+    });
+    expect(hashTree(bound.changeDir)).toEqual(sourceBefore);
+    expect(hashTree(plan.destination)).toEqual(archiveBefore);
+    expect(fs.readFileSync(planPath)).toEqual(planBefore);
+    expect(fs.existsSync(stored.paths.stage)).toBe(false);
+  }, 240_000);
 
   it('aborts when the planning worktree HEAD moved between plan and apply', async () => {
     const bound = await f.bind({

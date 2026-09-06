@@ -1586,6 +1586,7 @@ describe('archive apply named fault and recovery matrix', () => {
         git: {
           state: async () => 'git',
           exec: async (_gitRoot, args) => {
+            if (args.join(' ') === 'rev-parse --show-toplevel') return fs.realpath(root);
             if (args.join(' ') === 'rev-parse --verify HEAD^{commit}') return commit;
             if (args.join(' ') === 'rev-parse --abbrev-ref HEAD') return 'main';
             if (args.join(' ') === 'status --porcelain') {

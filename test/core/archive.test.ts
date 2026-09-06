@@ -2148,6 +2148,212 @@ The system SHALL do the thing differently.
       return changeDir;
     }
 
+    class InterruptedArchiveCommand extends ArchiveCommand {
+      protected override applyPlannedArchive(
+        plan: ArchivePlan,
+        options: ArchiveApplyOptions = {}
+      ): Promise<ArchiveApplyResult> {
+        return applyArchive(plan, {
+          ...options,
+          adapters: {
+            ...defaultArchiveEngineAdapters,
+            fs: {
+              ...defaultArchiveEngineAdapters.fs,
+              copyFile: async () => {
+                throw Object.assign(new Error('interrupted payload copy'), { code: 'EIO' });
+              },
+            },
+          },
+        });
+      }
+    }
+
+    interface PlanningProvenanceCase {
+      scenario: string;
+      dirtyFiles: string[];
+      planningTreeState: 'clean' | 'dirty';
+    }
+
+    const planningProvenanceCases: PlanningProvenanceCase[] = [
+      {
+        scenario: 'both repositories are clean',
+        dirtyFiles: [],
+        planningTreeState: 'clean',
+      },
+      {
+        scenario: 'only planning is dirty',
+        dirtyFiles: [path.join('rasen', 'dirty.txt')],
+        planningTreeState: 'dirty',
+      },
+      {
+        scenario: 'only the product is dirty',
+        dirtyFiles: ['dirty.txt'],
+        planningTreeState: 'clean',
+      },
+      {
+        scenario: 'only the active change is dirty',
+        dirtyFiles: [path.join('rasen', 'changes', 'nested-provenance', 'notes.txt')],
+        planningTreeState: 'dirty',
+      },
+    ];
+
+    it.each(planningProvenanceCases)(
+      'keeps nested planning Git provenance separate when $scenario',
+      async ({ dirtyFiles, planningTreeState }) => {
+        setUpGitRepo();
+        await fs.writeFile(path.join(tempDir, '.gitignore'), 'rasen/\n.rasen/\nxdg-data/\n');
+        execFileSync('git', ['checkout', '-b', 'product-branch'], { cwd: tempDir });
+        commitAll('initial product');
+        const codeCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
+          cwd: tempDir, encoding: 'utf8',
+        }).trim();
+        const planningHome = path.join(tempDir, 'rasen');
+        execFileSync('git', ['init', '-b', 'planning-main'], { cwd: planningHome });
+        const changeName = 'nested-provenance';
+        const changeDir = await seedChange(changeName);
+        await fs.writeFile(
+          path.join(changeDir, 'ship-log.md'),
+          `# Ship Log\n\n**Mode:** local\n**Commit:** ${codeCommit}\n`
+        );
+        execFileSync('git', ['add', 'changes'], { cwd: planningHome });
+        execFileSync('git', ['commit', '-m', 'initial planning'], { cwd: planningHome });
+        for (const dirtyFile of dirtyFiles) {
+          await fs.writeFile(path.join(tempDir, dirtyFile), 'uncommitted\n');
+        }
+
+        await archiveCommand.execute(changeName, {
+          dryRun: true, savePlan: true, yes: true, json: true,
+        });
+        const preview = parseLoggedArchive();
+        expect(preview.archive.plan.git.planning.branch).toBe('planning-main');
+        expect(preview.archive.plan.git.planning.treeState).toBe(planningTreeState);
+        expect(preview.archive.plan.git.execution.codeCommit).toBe(codeCommit);
+
+        vi.mocked(console.log).mockClear();
+        await new InterruptedArchiveCommand().execute(undefined, {
+          applyPlan: preview.archive.planToken, yes: true, json: true,
+        });
+        const interrupted = parseLoggedArchive();
+        expect(interrupted.archive.result.status).toBe('recoverable');
+        expect(interrupted.archive.result.blockers).toContainEqual(
+          expect.objectContaining({ code: 'EIO', message: 'interrupted payload copy' })
+        );
+
+        vi.mocked(console.log).mockClear();
+        await archiveCommand.execute(undefined, {
+          applyPlan: preview.archive.planToken, yes: true, json: true,
+        });
+        const applied = parseLoggedArchive();
+        expect(applied.archive.result.status, JSON.stringify(applied.archive.result)).toBe('complete');
+        const accounting = JSON.parse(
+          await fs.readFile(path.join(applied.archive.result.path, 'archive.json'), 'utf8')
+        );
+        expect(accounting.planningBranch).toBe('planning-main');
+        expect(accounting.planningTreeState).toBe(planningTreeState);
+        expect(accounting.codeCommit).toBe(codeCommit);
+      }
+    );
+
+    interface PlanningRecoveryDriftCase {
+      scenario: string;
+      plannedContent: string;
+      retryContent: string;
+      planningTreeState: 'clean' | 'dirty';
+    }
+
+    const planningRecoveryDriftCases: PlanningRecoveryDriftCase[] = [
+      {
+        scenario: 'clean-to-dirty',
+        plannedContent: '# Planning\n',
+        retryContent: '# Changed planning\n',
+        planningTreeState: 'clean',
+      },
+      {
+        scenario: 'dirty-to-clean',
+        plannedContent: '# Changed planning\n',
+        retryContent: '# Planning\n',
+        planningTreeState: 'dirty',
+      },
+    ];
+
+    it.each(planningRecoveryDriftCases)(
+      'rejects outside-owned planning $scenario drift during same-token recovery',
+      async ({ plannedContent, retryContent, planningTreeState }) => {
+        setUpGitRepo();
+        await fs.writeFile(path.join(tempDir, '.gitignore'), 'rasen/\n.rasen/\nxdg-data/\n');
+        commitAll('initial product');
+        const planningHome = path.join(tempDir, 'rasen');
+        execFileSync('git', ['init', '-b', 'planning-main'], { cwd: planningHome });
+        const changeName = 'planning-recovery-drift';
+        const changeDir = await seedChange(changeName);
+        const planningFile = path.join(planningHome, 'planning-file.md');
+        await fs.writeFile(planningFile, '# Planning\n');
+        execFileSync('git', ['add', '-A'], { cwd: planningHome });
+        execFileSync('git', ['commit', '-m', 'initial planning'], { cwd: planningHome });
+        await fs.writeFile(planningFile, plannedContent);
+        const ephemera = path.join(tempDir, '.rasen', 'changes', changeName, 'ephemera');
+        await fs.mkdir(ephemera, { recursive: true });
+        const trace = path.join(ephemera, 'trace.log');
+        await fs.writeFile(trace, 'temporary trace\n');
+
+        await archiveCommand.execute(changeName, {
+          dryRun: true, savePlan: true, yes: true, json: true,
+        });
+        const preview = parseLoggedArchive();
+        const token = preview.archive.planToken;
+        const plan = await loadStoredArchivePlan(token, getGlobalDataDir());
+        expect(plan.git.planning.treeState).toBe(planningTreeState);
+
+        vi.mocked(console.log).mockClear();
+        await new InterruptedArchiveCommand().execute(undefined, {
+          applyPlan: token, yes: true, json: true,
+        });
+        const interrupted = parseLoggedArchive();
+        expect(interrupted.archive.result).toMatchObject({
+          status: 'recoverable',
+          blockers: [expect.objectContaining({ operation: 'copy', code: 'EIO' })],
+        });
+        const journalBefore = await fs.readFile(plan.paths.journal);
+        const tasksBefore = await fs.readFile(path.join(changeDir, 'tasks.md'));
+        const traceBefore = await fs.readFile(trace);
+
+        await fs.writeFile(planningFile, retryContent);
+        vi.mocked(console.log).mockClear();
+        await archiveCommand.execute(undefined, {
+          applyPlan: token, yes: true, json: true,
+        });
+        const rejected = parseLoggedArchive();
+        expect(rejected.archive.result).toMatchObject({
+          status: 'recoverable',
+          planHash: plan.planHash,
+          blockers: [expect.objectContaining({ operation: 'git', code: 'ESTALE' })],
+        });
+        expect(await fs.readFile(planningFile, 'utf8')).toBe(retryContent);
+        expect(await fs.readFile(plan.paths.journal)).toEqual(journalBefore);
+        expect(await fs.readFile(path.join(changeDir, 'tasks.md'))).toEqual(tasksBefore);
+        expect(await fs.readFile(trace)).toEqual(traceBefore);
+        await expect(fs.access(plan.paths.final)).rejects.toMatchObject({ code: 'ENOENT' });
+        expect(await loadStoredArchivePlan(token, getGlobalDataDir())).toEqual(plan);
+
+        await fs.writeFile(planningFile, plannedContent);
+        vi.mocked(console.log).mockClear();
+        await archiveCommand.execute(undefined, {
+          applyPlan: token, yes: true, json: true,
+        });
+        const resumed = parseLoggedArchive();
+        expect(resumed.archive.result).toMatchObject({
+          status: 'complete',
+          planHash: plan.planHash,
+          resumed: true,
+        });
+        const accounting = JSON.parse(
+          await fs.readFile(path.join(plan.paths.final, 'archive.json'), 'utf8')
+        );
+        expect(accounting.planningTreeState).toBe(planningTreeState);
+        expect(await loadStoredArchivePlan(token, getGlobalDataDir())).toEqual(plan);
+      }
+    );
+
     it('a config still carrying destination: external still archives in-repo', async () => {
       await writeConfig('schema: spec-driven\narchive:\n  destination: external\n');
       setUpGitRepo();
