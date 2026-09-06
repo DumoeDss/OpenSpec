@@ -29,6 +29,10 @@ import {
   type ResolveArchiveAccountingInput,
 } from './archive-accounting.js';
 import {
+  isArchiveOsMetadataName,
+  isExcludedArchiveOsMetadata,
+} from './archive-os-metadata.js';
+import {
   resolveArchiveV2Accounting,
   verifyArchiveV2Accounting,
   writeArchiveV2Json,
@@ -1077,10 +1081,13 @@ export function hashArchivePlan(
 /**
  * A symlink-safe, deterministic source identity. Engine control files are
  * omitted because they are intent/recovery transport, not archive payload.
+ * Known regular OS metadata is omitted at every depth; canonical spec deletion
+ * explicitly requests the exact inventory instead of the archive payload policy.
  */
 export async function fingerprintArchiveTree(
   root: string,
-  adapters: ArchiveEngineAdapters = defaultArchiveEngineAdapters
+  adapters: ArchiveEngineAdapters = defaultArchiveEngineAdapters,
+  options: { excludeOsMetadata?: boolean } = {}
 ): Promise<ArchiveTreeFingerprint> {
   const entries: ArchiveTreeEntry[] = [];
   const authorityEntries: ArchiveAuthorityEntry[] = [];
@@ -1091,9 +1098,16 @@ export async function fingerprintArchiveTree(
     directoryBefore: ArchiveFsStat
   ): Promise<void> {
     const dirents = await adapters.fs.readdir(directory, { withFileTypes: true });
-    const filtered = dirents
-      .filter(dirent => prefix || !isArchivePayloadControlName(dirent.name))
-      .sort((left, right) => left.name.localeCompare(right.name));
+    const filtered: Dirent[] = [];
+    dirents.sort((left, right) => left.name.localeCompare(right.name));
+    for (const dirent of dirents) {
+      if (!prefix && isArchivePayloadControlName(dirent.name)) continue;
+      if (
+        options.excludeOsMetadata !== false &&
+        await isExcludedArchiveOsMetadata(directory, dirent, adapters.fs)
+      ) continue;
+      filtered.push(dirent);
+    }
     if (!prefix) {
       for (const controlName of [
         '.rasen-archive-input.json',
@@ -1192,10 +1206,16 @@ export async function fingerprintArchiveTree(
       }
     }
 
-    const namesAfter = (await adapters.fs.readdir(directory, { withFileTypes: true }))
-      .filter(dirent => prefix || !isArchivePayloadControlName(dirent.name))
-      .map(dirent => dirent.name)
-      .sort((left, right) => left.localeCompare(right));
+    const namesAfter: string[] = [];
+    for (const dirent of await adapters.fs.readdir(directory, { withFileTypes: true })) {
+      if (!prefix && isArchivePayloadControlName(dirent.name)) continue;
+      if (
+        options.excludeOsMetadata !== false &&
+        await isExcludedArchiveOsMetadata(directory, dirent, adapters.fs)
+      ) continue;
+      namesAfter.push(dirent.name);
+    }
+    namesAfter.sort((left, right) => left.localeCompare(right));
     if (
       stableArchiveJson(namesAfter) !==
       stableArchiveJson(filtered.map(dirent => dirent.name))
@@ -1257,6 +1277,25 @@ function archiveDeletionAuthorityMatches(
     stableArchiveJson(left.authorityEntries) ===
       stableArchiveJson(right.authorityEntries)
   );
+}
+
+export function assertArchiveOsMetadataAuthorityCompatible(
+  authority: ArchiveTreeFingerprint | null | undefined,
+  target: string
+): void {
+  const recorded = authority?.authorityEntries.find(
+    entry => entry.kind === 'file' && isArchiveOsMetadataName(path.posix.basename(entry.path))
+  ) ?? authority?.entries.find(
+    entry => entry.kind === 'file' && isArchiveOsMetadataName(path.posix.basename(entry.path))
+  );
+  if (recorded) {
+    throw archiveDeterministicInputError(
+      'archive_os_metadata_policy_incompatible',
+      `Saved archive authority at ${target} records ${recorded.path} as payload under the previous OS metadata policy. ` +
+      'Automatic archive operations cannot reclassify immutable historical evidence. ' +
+      'Preserve the saved plan and archive; resolve the transaction with the original engine before creating a new plan.'
+    );
+  }
 }
 
 export function projectArchiveCleaner(
@@ -1674,6 +1713,7 @@ async function inventoryHandoff(
       const relative = normalizeRelative(path.join('handoff', prefix, entry.name));
       let stat: ArchiveFsStat;
       try {
+        if (await isExcludedArchiveOsMetadata(directory, entry, adapters.fs)) continue;
         stat = await adapters.fs.lstat(absolute);
       } catch (error) {
         blockers.push(blocker('handoff-lstat', absolute, error));
@@ -2177,6 +2217,7 @@ async function discoverArchiveEvidenceInputs(
       const relative = normalizeRelative(prefix ? path.join(prefix, entry.name) : entry.name);
       let stat: ArchiveFsStat;
       try {
+        if (await isExcludedArchiveOsMetadata(directory, entry, adapters.fs)) continue;
         stat = await adapters.fs.lstat(absolute);
       } catch (error) {
         blockers.push(blocker('evidence', absolute, error));
@@ -3101,7 +3142,8 @@ export async function createArchivePlan(
           rawAction.action === 'delete'
             ? await fingerprintArchiveTree(
                 path.dirname(rawAction.target),
-                adapters
+                adapters,
+                { excludeOsMetadata: false }
               )
             : undefined;
         if (capabilityTree !== undefined) {
@@ -4502,7 +4544,13 @@ function parseArchiveJournalV2(
     }
   }
 
-  return value as unknown as ArchiveJournal;
+  const journal = value as unknown as ArchiveJournal;
+  for (const phase of Object.values(journal.phaseFingerprints)) {
+    assertArchiveOsMetadataAuthorityCompatible(phase.before, journalPath);
+    assertArchiveOsMetadataAuthorityCompatible(phase.expectedAfter, journalPath);
+    assertArchiveOsMetadataAuthorityCompatible(phase.observedAfter, journalPath);
+  }
+  return journal;
 }
 
 function isStoredArchiveAbortClaim(
@@ -5103,11 +5151,13 @@ export async function abortArchivePlan(
   }
   try {
     assertStoredArchivePlanPaths(plan);
+    assertArchiveOsMetadataAuthorityCompatible(plan.sourceFingerprint, plan.paths.active);
+    assertArchiveOsMetadataAuthorityCompatible(existingTombstone?.stageAuthority, tombstonePath);
   } catch (error) {
     return blocked(
       'validation',
       plan.paths.final,
-      'archive_abort_plan_invalid',
+      errorCode(error) ?? 'archive_abort_plan_invalid',
       error instanceof Error ? error.message : String(error)
     );
   }
@@ -5196,9 +5246,11 @@ export async function abortArchivePlan(
         publishedJournalState === 'present'
           ? plan.paths.publishedJournal
           : plan.paths.final,
-        errorCode(error) === 'archive_journal_invalid'
-          ? 'archive_abort_journal_invalid'
-          : 'archive_abort_ownership_unverified',
+        errorCode(error) === 'archive_os_metadata_policy_incompatible'
+          ? 'archive_os_metadata_policy_incompatible'
+          : errorCode(error) === 'archive_journal_invalid'
+            ? 'archive_abort_journal_invalid'
+            : 'archive_abort_ownership_unverified',
         error instanceof Error ? error.message : String(error)
       );
     }
@@ -5326,7 +5378,9 @@ export async function abortArchivePlan(
       return blocked(
         'journal',
         plan.paths.journal,
-        'archive_abort_journal_invalid',
+        errorCode(error) === 'archive_os_metadata_policy_incompatible'
+          ? 'archive_os_metadata_policy_incompatible'
+          : 'archive_abort_journal_invalid',
         error instanceof Error ? error.message : String(error)
       );
     }
@@ -5833,7 +5887,8 @@ export async function abortArchivePlan(
             privateClaim.claimed,
             authority,
             adapters,
-            true
+            true,
+            plan.transactionId
           );
           if (journalState === 'present') {
             await adapters.fs.unlink(claimedJournal);
@@ -6852,6 +6907,7 @@ function applyFailure(
   effectivePhase: Exclude<ArchiveJournalPhase, 'failed'>
 ): ArchiveApplyResult {
   const code = errorCode(error);
+  const metadataPolicyIncompatible = code === 'archive_os_metadata_policy_incompatible';
   const deterministicInputFailure =
     code === ARCHIVE_HANDOFF_PROJECTION_COLLISION_CODE ||
     code === ARCHIVE_ACCOUNTING_PROJECTION_COLLISION_CODE ||
@@ -6906,6 +6962,7 @@ function applyFailure(
       : deterministicManualRecovery ||
           ancestryManualRecovery ||
           reservationManualRecovery ||
+          metadataPolicyIncompatible ||
           code === 'archive_journal_invalid' ||
           code === ARCHIVE_CLEANER_OWNERSHIP_CODE ||
           code === 'planning_execution_binding_mismatch' ||
@@ -6940,6 +6997,7 @@ function applyFailure(
   const manualRecoveryRequired =
     deterministicManualRecovery ||
     ancestryManualRecovery ||
+    metadataPolicyIncompatible ||
     code === 'archive_journal_invalid' ||
     reservationManualRecovery ||
     transactionTempManualRecovery ||
@@ -6950,7 +7008,7 @@ function applyFailure(
     code === 'planning_execution_binding_mismatch' ||
     code === 'archive_accounting_ownership_unverified';
   return {
-    status: abortRequired ? 'abort-required' : 'recoverable',
+    status: metadataPolicyIncompatible ? 'blocked' : abortRequired ? 'abort-required' : 'recoverable',
     transactionId: plan.transactionId,
     planHash: plan.planHash,
     change: plan.change,
@@ -6980,6 +7038,9 @@ function applyFailure(
             manualRecoveryAction: {
               kind: 'manual-recovery-required' as const,
               guidance:
+                metadataPolicyIncompatible
+                  ? 'Preserve the saved plan, archive, and journal unchanged. Their exact authorities use the previous OS metadata policy; resolve that transaction with its original engine instead of reclassifying historical evidence.'
+                  :
                 code === ARCHIVE_STAGE_OWNERSHIP_CODE
                   ? `Preserve the unrecognized archive stage at ${operationPath} and every retained path reported by this result; no matching durable stage ownership was verified, so neither retry nor abort may remove it without operator verification.`
                   : code === ARCHIVE_CLAIM_OWNERSHIP_CODE
@@ -7167,6 +7228,7 @@ async function copyArchivePayload(
   entries.sort((left, right) => left.name.localeCompare(right.name));
   for (const entry of entries) {
     if (topLevel && isArchivePayloadControlName(entry.name)) continue;
+    if (await isExcludedArchiveOsMetadata(source, entry, adapters.fs)) continue;
     const from = path.join(source, entry.name);
     const to = path.join(target, entry.name);
     const stat = await adapters.fs.lstat(from);
@@ -7575,12 +7637,15 @@ async function listReservedArchivePayloadPaths(
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
       if (!prefix && ARCHIVE_CONTROL_FILENAMES.has(entry.name)) continue;
+      if (await isExcludedArchiveOsMetadata(current, entry, adapters.fs)) continue;
       const relative = normalizeRelative(
         prefix ? path.join(prefix, entry.name) : entry.name
       );
+      const absolute = path.join(current, entry.name);
+      const stat = await adapters.fs.lstat(absolute);
       paths.push(relative);
-      if (entry.isDirectory() && !entry.isSymbolicLink()) {
-        await walk(path.join(current, entry.name), relative);
+      if (stat.isDirectory() && !stat.isSymbolicLink()) {
+        await walk(absolute, relative);
       }
     }
   }
@@ -7590,10 +7655,16 @@ async function listReservedArchivePayloadPaths(
 
 async function listArchiveReservationOccupants(
   directory: string,
-  adapters: ArchiveEngineAdapters
+  adapters: ArchiveEngineAdapters,
+  owned = false
 ): Promise<string[]> {
   const entries = await adapters.fs.readdir(directory, { withFileTypes: true });
-  return entries.map(entry => entry.name).sort();
+  const occupants: string[] = [];
+  for (const entry of entries) {
+    if (owned && await isExcludedArchiveOsMetadata(directory, entry, adapters.fs)) continue;
+    occupants.push(entry.name);
+  }
+  return occupants.sort();
 }
 
 function archiveReservationOwnershipError(
@@ -7625,7 +7696,7 @@ async function verifyReservedIntentTarget(
     }
     if (
       kind === 'directory' &&
-      (await adapters.fs.readdir(absolute, { withFileTypes: true })).length > 0
+      (await listArchiveReservationOccupants(absolute, adapters, true)).length > 0
     ) {
       throw new Error('Expected an empty newly-created directory.');
     }
@@ -7762,6 +7833,7 @@ async function copyArchivePayloadIntoReservation(
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
       if (!prefix && ARCHIVE_CONTROL_FILENAMES.has(entry.name)) continue;
+      if (await isExcludedArchiveOsMetadata(source, entry, adapters.fs)) continue;
       const from = path.join(source, entry.name);
       const relative = normalizeRelative(
         prefix ? path.join(prefix, entry.name) : entry.name
@@ -7861,11 +7933,71 @@ function identityForAuthorityEntry(
   return archiveDeletionIdentity(stat, kind);
 }
 
+/**
+ * Dispose metadata only inside an already owned stage or claimed source.
+ * Each file is isolated with the existing no-follow private-claim protocol;
+ * a raced directory/symlink is retained, not unlinked by its metadata name.
+ */
+async function removeArchiveOsMetadataFiles(
+  root: string,
+  directory: string,
+  expectedDirectory: ArchiveStatIdentity,
+  transactionId: string,
+  adapters: ArchiveEngineAdapters
+): Promise<void> {
+  const bindings = await bindArchiveRealDirectoryChain(root, directory, adapters);
+  if (
+    stableArchiveJson(bindings.at(-1)?.identity) !== stableArchiveJson(expectedDirectory)
+  ) {
+    throw staleArchiveObject(directory, 'Archive metadata cleanup directory changed identity');
+  }
+  for (const entry of await adapters.fs.readdir(directory, { withFileTypes: true })) {
+    if (!await isExcludedArchiveOsMetadata(directory, entry, adapters.fs)) continue;
+    const source = path.join(directory, entry.name);
+    let stat: ArchiveFsStat;
+    try {
+      stat = await adapters.fs.lstat(source);
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') continue;
+      throw error;
+    }
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw staleArchiveObject(source, 'Archive metadata changed type before cleanup');
+    }
+    await requireArchiveRealDirectoryChain(bindings, adapters);
+    const claim = await moveArchiveObjectToPrivateClaim(
+      source,
+      archiveDeletionIdentity(stat, 'file'),
+      'file',
+      transactionId,
+      `os-metadata:${entry.name}`,
+      adapters,
+      'exact-source-rename-stable'
+    );
+    await requireArchiveRealDirectoryChain(bindings, adapters);
+    await requireArchivePrivateClaim(claim, adapters);
+    const claimed = await adapters.fs.lstat(claim.claimed);
+    const claimedIdentity = archivePrivateClaimedObjectIdentities.get(claim);
+    if (
+      !claimed.isFile() ||
+      claimed.isSymbolicLink() ||
+      claimedIdentity === undefined ||
+      !sameExactArchiveObject(claimed, claimedIdentity, 'file')
+    ) {
+      throw archiveClaimOwnershipError(claim.root, 'Claimed OS metadata changed before unlink.');
+    }
+    await adapters.fs.unlink(claim.claimed);
+    await retireArchivePrivateClaim(claim, adapters);
+  }
+  await requireArchiveRealDirectoryChain(bindings, adapters);
+}
+
 async function removeClaimedArchiveEntriesGuarded(
   claimedRoot: string,
   authority: ArchiveTreeFingerprint,
   adapters: ArchiveEngineAdapters,
-  allowMissing = false
+  allowMissing = false,
+  metadataTransactionId?: string
 ): Promise<void> {
   const ordered = [...authority.authorityEntries].sort(
     (left, right) =>
@@ -7899,8 +8031,21 @@ async function removeClaimedArchiveEntriesGuarded(
       (conflict as NodeJS.ErrnoException).code = 'ESTALE';
       throw conflict;
     }
-    if (kind === 'directory') await adapters.fs.rmdir(absolute);
-    else await adapters.fs.unlink(absolute);
+    if (kind === 'directory') {
+      if (metadataTransactionId !== undefined) {
+        await removeArchiveOsMetadataFiles(
+          claimedRoot, absolute, entry.identity, metadataTransactionId, adapters
+        );
+      }
+      await adapters.fs.rmdir(absolute);
+    } else {
+      await adapters.fs.unlink(absolute);
+    }
+  }
+  if (metadataTransactionId !== undefined) {
+    await removeArchiveOsMetadataFiles(
+      claimedRoot, claimedRoot, authority.rootIdentity, metadataTransactionId, adapters
+    );
   }
 }
 
@@ -7908,18 +8053,22 @@ async function removeClaimedArchiveEntriesGuarded(
  * Delete only the exact objects represented by a previously verified
  * deletion authority. Every leaf is revalidated immediately before unlink;
  * directories are removed bottom-up without recursive rm.
+ * Metadata disposal is opt-in for transaction-owned stage/source trees, never
+ * for canonical spec trees or arbitrary final archive occupants.
  */
 export async function removeClaimedArchiveTreeGuarded(
   claimedRoot: string,
   authority: ArchiveTreeFingerprint,
   adapters: ArchiveEngineAdapters = defaultArchiveEngineAdapters,
-  allowMissing = false
+  allowMissing = false,
+  metadataTransactionId?: string
 ): Promise<void> {
   await removeClaimedArchiveEntriesGuarded(
     claimedRoot,
     authority,
     adapters,
-    allowMissing
+    allowMissing,
+    metadataTransactionId
   );
   const rootStat = await adapters.fs.lstat(claimedRoot);
   if (
@@ -8386,7 +8535,9 @@ async function removeArchiveStageGuarded(
     await removeClaimedArchiveEntriesGuarded(
       claim.claimed,
       current,
-      adapters
+      adapters,
+      false,
+      plan.transactionId
     );
     if (journalIdentity !== null) {
       const claimedJournal = path.join(
@@ -8633,6 +8784,9 @@ async function applyStagedHandoff(
       );
       let entries: Dirent[];
       try {
+        await removeArchiveOsMetadataFiles(
+          plan.paths.stage, directory, expected.identity, plan.transactionId, adapters
+        );
         entries = await adapters.fs.readdir(directory, { withFileTypes: true });
       } catch (error) {
         if (errorCode(error) === 'ENOENT') continue;
@@ -8667,6 +8821,9 @@ async function applyStagedHandoff(
         plan.transactionId,
         `handoff-directory:${expected.path}`,
         adapters
+      );
+      await removeArchiveOsMetadataFiles(
+        claim.claimed, claim.claimed, expected.identity, plan.transactionId, adapters
       );
       const claimedEntries = await adapters.fs.readdir(claim.claimed, {
         withFileTypes: true,
@@ -9064,6 +9221,7 @@ export async function captureArchiveQuality(
     }
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
+      if (await isExcludedArchiveOsMetadata(directory, entry, adapters.fs)) continue;
       const absolute = path.join(directory, entry.name);
       const relative = normalizeRelative(prefix ? path.join(prefix, entry.name) : entry.name);
       const stat = await adapters.fs.lstat(absolute);
@@ -9659,7 +9817,11 @@ async function applySpecActions(
           capabilityDirectoryBinding,
           adapters
         );
-        const current = await fingerprintArchiveTree(capabilityDirectory, adapters);
+        const current = await fingerprintArchiveTree(
+          capabilityDirectory,
+          adapters,
+          { excludeOsMetadata: false }
+        );
         if (
           !archiveDeletionAuthorityMatches(
             current,
@@ -9694,7 +9856,11 @@ async function applySpecActions(
         );
       }
       if (progress.state !== 'claimed') {
-        const claimed = await fingerprintArchiveTree(quarantine, adapters);
+        const claimed = await fingerprintArchiveTree(
+          quarantine,
+          adapters,
+          { excludeOsMetadata: false }
+        );
         if (
           !archiveDeletionAuthorityMatches(
             claimed,
@@ -10397,28 +10563,11 @@ async function revalidateArchiveGitPlan(
   if (recoveryOwned && actual.planningGitRoot !== null) {
     const planningGitRoot = actual.planningGitRoot;
     const foundationRoot = await adapters.fs.realpath(plan.roots.planning);
-    const excluded = [
-      plan.paths.active,
-      plan.paths.stage,
-      plan.paths.final,
-      plan.paths.ephemera,
-      path.join(
-        path.dirname(plan.paths.active),
-        `.rasen-archive-source-${plan.transactionId}`
-      ),
-      ...plan.specActions.map(action => action.target),
-      ...plan.specActions.map(action => {
-        const actionId = action.actionId ?? adapters.sha256(stableArchiveJson(action));
-        const parent =
-          action.action === 'delete'
-            ? path.dirname(path.dirname(action.target))
-            : path.dirname(action.target);
-        return path.join(
-          parent,
-          `.rasen-archive-spec-${plan.transactionId}-${actionId.slice(0, 12)}`
-        );
-      }),
-    ]
+    // This check runs only before archiveJournalHasDurableMutation consumes the
+    // planned Git facts. Until then, only the owned stage can contain archive
+    // writes; active, spec, and ephemera paths still hold the original inputs.
+    // Keep their pre-existing dirt in the same full-tree comparison as the plan.
+    const excluded = [plan.paths.stage]
       .map(candidate =>
         path.resolve(foundationRoot, path.relative(plan.roots.planning, candidate))
       )
@@ -10514,6 +10663,11 @@ export function inspectArchiveApplyPlan(
         )
       : [...plan.blockers];
   const assertionSatisfied = blockers.length < plan.blockers.length;
+  try {
+    assertArchiveOsMetadataAuthorityCompatible(plan.sourceFingerprint, plan.paths.active);
+  } catch (error) {
+    blockers.push(blocker('validation', plan.paths.active, error));
+  }
   return {
     applicable:
       blockers.length === 0 && (plan.complete || assertionSatisfied),
@@ -10760,7 +10914,9 @@ export async function applyArchive(
       adapters,
       { recoveryOwned: true, allowUnbound: true }
     );
-    await removeClaimedArchiveTreeGuarded(projection, authority, adapters);
+    await removeClaimedArchiveTreeGuarded(
+      projection, authority, adapters, false, plan.transactionId
+    );
     archivePathAuthority = await assertArchivePathAuthority(
       plan,
       archivePathAuthority,
@@ -11590,10 +11746,16 @@ export async function applyArchive(
             ? reservationIntent.failure!.resumePhase
             : reservationIntent.phase;
         const reservationStat = await adapters.fs.lstat(plan.paths.final);
-        const occupants =
+        let occupants =
           reservationStat.isDirectory() && !reservationStat.isSymbolicLink()
             ? await listArchiveReservationOccupants(plan.paths.final, adapters)
             : ['(non-directory target)'];
+        // Metadata alone cannot grant ownership of an unknown final directory.
+        // Only a verified transaction sentinel permits the payload exclusion.
+        if (occupants.includes(ARCHIVE_FINAL_OWNER_FILENAME)) {
+          await verifyArchiveFinalOwner(plan, adapters);
+          occupants = await listArchiveReservationOccupants(plan.paths.final, adapters, true);
+        }
         const emptyReservation = occupants.length === 0;
         const ownerOnlyReservation =
           stableArchiveJson(occupants) ===
@@ -12109,7 +12271,7 @@ export async function applyArchive(
         const reservationStat = await adapters.fs.lstat(plan.paths.final);
         const initialOccupants =
           reservationStat.isDirectory() && !reservationStat.isSymbolicLink()
-            ? await listArchiveReservationOccupants(plan.paths.final, adapters)
+            ? await listArchiveReservationOccupants(plan.paths.final, adapters, true)
             : ['(non-directory target)'];
         if (
           !reservationStat.isDirectory() ||
@@ -12708,7 +12870,9 @@ export async function applyArchive(
       await removeClaimedArchiveTreeGuarded(
         sourceQuarantine,
         plan.sourceFingerprint,
-        adapters
+        adapters,
+        false,
+        plan.transactionId
       );
       currentOperationPath = sourceClaimRoot;
       await removeVerifiedEmptyClaimRoot(

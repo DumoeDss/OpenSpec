@@ -23,6 +23,7 @@ import {
   ARCHIVE_PLAN_VERSION,
   abortArchivePlan,
   applyArchive,
+  assertArchiveOsMetadataAuthorityCompatible,
   createArchivePlan,
   defaultArchiveEngineAdapters,
   fingerprintArchiveTree,
@@ -1678,6 +1679,7 @@ export class ChangeFinalization implements ChangeFinalizationModule {
     // whether the transaction-owned progressed state may advance.
     const plannedSource = fresh ? archivePlan.sourceFingerprint : null;
     if (plannedSource !== null) {
+      assertArchiveOsMetadataAuthorityCompatible(plannedSource, archivePlan.paths.active);
       const currentSource = await fingerprintArchiveTree(archivePlan.paths.active);
       if (currentSource.digest !== plannedSource.digest) {
         throw staleRefusal(
