@@ -5,7 +5,11 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { createHash } from 'node:crypto';
 
-import { resolveArchiveAccounting, writeArchiveJson } from '../../src/core/archive-accounting.js';
+import {
+  resolveArchiveAccounting,
+  verifyArchiveAccounting,
+  writeArchiveJson,
+} from '../../src/core/archive-accounting.js';
 import { isolatedGitEnv } from '../helpers/store-git.js';
 
 /**
@@ -78,6 +82,10 @@ describe('archive-accounting', () => {
     fs.mkdirSync(evidenceDir, { recursive: true });
     fs.writeFileSync(path.join(evidenceDir, 'review-report.md'), '# Review\nAll clean.');
     fs.writeFileSync(path.join(evidenceDir, 'ship-log.md'), '# Ship\nCommit: abc');
+    fs.mkdirSync(path.join(evidenceDir, 'nested'), { recursive: true });
+    fs.writeFileSync(path.join(evidenceDir, '.DS_Store'), 'not evidence');
+    fs.writeFileSync(path.join(evidenceDir, 'nested', 'THUMBS.DB'), 'not evidence');
+    fs.writeFileSync(path.join(evidenceDir, 'nested', 'desktop.ini'), 'not evidence');
 
     const accounting = await resolveArchiveAccounting({
       changeName: 'test-change',
@@ -89,6 +97,10 @@ describe('archive-accounting', () => {
       probes: [],
     });
 
+    expect(accounting.evidence.map(entry => entry.path)).toEqual([
+      'evidence/review-report.md',
+      'evidence/ship-log.md',
+    ]);
     const reviewEntry = accounting.evidence.find((e) => e.path === 'evidence/review-report.md');
     expect(reviewEntry).toBeDefined();
     expect(reviewEntry!.sha256).toBe(sha256(path.join(evidenceDir, 'review-report.md')));
@@ -198,4 +210,51 @@ describe('archive-accounting', () => {
     ]);
     expect(written.probes).toEqual([{ path: 'experiments/probe1', codeCommit: headSha }]);
   });
+
+  interface HistoricalMetadataMutation {
+    readonly scenario: string;
+    readonly mutate: (target: string) => void;
+  }
+
+  const historicalMetadataMutations: HistoricalMetadataMutation[] = [
+    {
+      scenario: 'changed metadata bytes',
+      mutate: (target: string) => fs.writeFileSync(target, 'changed after historical receipt'),
+    },
+    {
+      scenario: 'removed metadata evidence',
+      mutate: (target: string) => fs.unlinkSync(target),
+    },
+  ];
+
+  it.each(historicalMetadataMutations)(
+    'verifies historical metadata digests and still rejects $scenario',
+    async ({ mutate }) => {
+      const evidenceDir = path.join(archivedDir, 'evidence');
+      fs.mkdirSync(evidenceDir, { recursive: true });
+      const metadataPath = path.join(evidenceDir, '.DS_Store');
+      fs.writeFileSync(metadataPath, 'historically recorded payload');
+      const accounting = await resolveArchiveAccounting({
+        changeName: 'test-change',
+        archivedDir,
+        executionRoot: planningRoot,
+        planningRoot,
+        ephemeraDiscarded: [],
+        handoffAbsorbed: [],
+        probes: [],
+      });
+      accounting.evidence = [{ path: 'evidence/.DS_Store', sha256: sha256(metadataPath) }];
+      await writeArchiveJson(archivedDir, accounting);
+      const ledgerPath = path.join(archivedDir, 'archive.json');
+      const originalReceipt = fs.readFileSync(ledgerPath);
+      fs.writeFileSync(path.join(evidenceDir, 'Thumbs.db'), 'new unrecorded metadata');
+      await verifyArchiveAccounting(archivedDir, accounting);
+      expect(fs.readFileSync(ledgerPath)).toEqual(originalReceipt);
+      mutate(metadataPath);
+      await expect(verifyArchiveAccounting(archivedDir, accounting)).rejects.toMatchObject({
+        operation: 'archive-json-evidence-verify',
+      });
+      expect(fs.readFileSync(ledgerPath)).toEqual(originalReceipt);
+    }
+  );
 });
