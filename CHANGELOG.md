@@ -8,6 +8,8 @@
 
 ### Changed
 
+- Repo-local planning roots discovered as the nearest root now expose the resolver's authoritative `root.scope` in JSON discovery, including `list`, `status`, `instructions`, and `context`. Typed planning locations remain available without an active Change, while existing `root.path`, `root.source`, configuration-inheritance notices, and Store migration boundaries are preserved.
+
 ## 0.1.7
 
 ### Added

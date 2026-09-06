@@ -39,12 +39,17 @@ describe('resolveOpenSpecRoot', () => {
       fs.mkdtempSync(path.join(os.tmpdir(), 'rasen-root-selection-'))
     );
     globalDataDir = path.join(tempDir, 'global-data');
-    // Backstop: store calls below thread `globalDataDir`, but if a future
-    // edit forgets one, the path resolver falls back to XDG_DATA_HOME and
-    // then to the real ~/.local/share/openspec. Pin XDG at the temp dir so
-    // a missed arg can never pollute the developer's home registry.
+    // Store calls below thread `globalDataDir`. Keep fallback registry and
+    // configuration reads inside this fixture too, so an omitted override
+    // cannot reach the developer's machine home.
     savedXdgDataHome = process.env.XDG_DATA_HOME;
     process.env.XDG_DATA_HOME = path.join(tempDir, 'xdg');
+    const homeDir = mkdir('home');
+    vi.stubEnv('HOME', homeDir);
+    vi.stubEnv('USERPROFILE', homeDir);
+    vi.stubEnv('RASEN_HOME', path.join(tempDir, 'machine'));
+    vi.stubEnv('XDG_CONFIG_HOME', path.join(tempDir, 'config'));
+    vi.stubEnv('RASEN_LANG', 'en');
   });
 
   afterEach(() => {
@@ -53,6 +58,7 @@ describe('resolveOpenSpecRoot', () => {
     } else {
       process.env.XDG_DATA_HOME = savedXdgDataHome;
     }
+    vi.unstubAllEnvs();
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
@@ -263,6 +269,18 @@ describe('resolveOpenSpecRoot', () => {
 
     expect(root.source).toBe('nearest');
     expect(root.path).toBe(repoRoot);
+    expect(root.planningScope).toMatchObject({
+      kind: 'standalone',
+      source: 'nearest-standalone',
+      ref: { mode: 'standalone', projectRoot: repoRoot },
+      paths: {
+        'planning-checkout': repoRoot,
+        'active-changes': path.join(repoRoot, 'rasen', 'changes'),
+        'archive-line': path.join(repoRoot, 'rasen', 'changes', 'archive'),
+        specs: path.join(repoRoot, 'rasen', 'specs'),
+        'project-design-docs': path.join(repoRoot, 'rasen', 'design-docs'),
+      },
+    });
   });
 
   it('ignores leftover workspace view state when a nearest root exists', async () => {
@@ -400,6 +418,19 @@ describe('resolveOpenSpecRoot', () => {
         expect(root.source).toBe('nearest');
         expect(root.path).toBe(repo);
         expect(root.storeId).toBeUndefined();
+        expect(root.planningScope).toMatchObject({
+          kind: 'standalone',
+          source: 'project-binding',
+          ref: { mode: 'standalone', projectRoot: repo },
+          paths: {
+            'active-changes': path.join(repo, 'rasen', 'changes'),
+            'archive-line': path.join(repo, 'rasen', 'changes', 'archive'),
+            specs: path.join(repo, 'rasen', 'specs'),
+          },
+          notices: [
+            expect.objectContaining({ code: 'configuration_store_inheritance' }),
+          ],
+        });
       } finally {
         console.error = original;
       }
@@ -935,6 +966,12 @@ describe('resolveOpenSpecRoot', () => {
       expect(root.path).toBe(checkout);
       expect(root.changesDir).toBe(path.join(checkout, 'rasen', 'changes'));
       expect(root.storeId).toBeUndefined();
+      expect(root.source).toBe('nearest');
+      expect(root.planningScope).toMatchObject({
+        kind: 'standalone',
+        source: 'project-binding',
+        ref: { mode: 'standalone', projectId: 'elftia', projectRoot: checkout },
+      });
     });
   });
 

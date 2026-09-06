@@ -294,29 +294,39 @@ describe('declared store fallback (3.2)', () => {
     expect(fs.existsSync(path.join(subdir, '.codex'))).toBe(false);
   });
 
-  it('keeps real-root stdout byte-identical when a pointer is present, with one notice', async () => {
+  it('keeps local planning locations while exposing configuration inheritance evidence', async () => {
     const realRepo = path.join(tempDir, 'real-repo');
     createOpenSpecRoot(realRepo);
-    const runs: Record<string, { stdout: string; notices: number }> = {};
+    const runs: string[] = [];
 
-    for (const [label, config] of [
-      ['without', 'schema: spec-driven\n'],
-      ['with', 'schema: spec-driven\nstore: team-context\n'],
-    ] as const) {
+    for (const config of [
+      'schema: spec-driven\n',
+      'schema: spec-driven\nstore: team-context\n',
+    ]) {
       fs.writeFileSync(path.join(realRepo, 'rasen', 'config.yaml'), config);
       const result = await runCLI(['list', '--json'], { cwd: realRepo, env });
       expect(result.exitCode).toBe(0);
-      runs[label] = {
-        stdout: result.stdout,
-        // team-context is registered, so the both-present pointer now emits the
-        // inheriting-store-config notice (store-config-inheritance), not the old
-        // ignored-pointer warning.
-        notices: (result.stderr.match(/configuration inherits from that store/g) ?? []).length,
-      };
+      runs.push(result.stdout);
     }
 
-    expect(runs.with.stdout).toBe(runs.without.stdout);
-    expect(runs.without.notices).toBe(0);
-    expect(runs.with.notices).toBe(1);
+    const local = JSON.parse(runs[0]);
+    const inherited = JSON.parse(runs[1]);
+    expect(local.root).toMatchObject({
+      path: fs.realpathSync(realRepo),
+      source: 'nearest',
+      scope: { kind: 'standalone', source: 'nearest-standalone', notices: [] },
+    });
+    expect(inherited.root).toMatchObject({
+      path: local.root.path,
+      source: local.root.source,
+      scope: {
+        kind: 'standalone',
+        source: 'project-binding',
+        ref: local.root.scope.ref,
+        paths: local.root.scope.paths,
+        notices: [expect.objectContaining({ code: 'configuration_store_inheritance' })],
+      },
+    });
+    expect(inherited.root).not.toHaveProperty('store_id');
   });
 });

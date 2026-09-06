@@ -434,9 +434,9 @@ async function storeFinalizationDiagnostic(
   }
   if (root.planningScope !== undefined) return null;
 
-  // No scope description at all. That is not "not a Store": ONLY the authoring
-  // resolution attaches one, and `resolveOpenSpecRoot` deliberately hands every
-  // legacy flat Store back through the frozen compatibility adapter, which
+  // No scope description at all. That is not "not a Store":
+  // resolveOpenSpecRoot deliberately hands every legacy flat Store back
+  // through the frozen compatibility adapter, which
   // attaches none — through `--store`, through a `store:` pointer, and from
   // inside the Store checkout alike. Keying the refusal on the scope alone left
   // it unreachable: `rasen new change` refused while `rasen archive` still
