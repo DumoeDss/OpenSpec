@@ -8,6 +8,10 @@
 
 ### Changed
 
+### Fixed
+
+- Archive now records the branch and working-tree state of the Git repository owning `rasen/`, including independent nested planning repositories. Saved-plan revalidation and recovery use the same repository without changing product `codeCommit` provenance or rewriting existing archive evidence.
+
 ## 0.1.7
 
 ### Added

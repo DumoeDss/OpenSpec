@@ -2349,7 +2349,15 @@ async function resolveArchiveGitPlan(
   planningRoot: string,
   executionRoot: string,
   adapters: ArchiveEngineAdapters
-): Promise<{ git: ArchivePlan['git']; blockers: ArchiveBlocker[] }> {
+): Promise<{
+  git: ArchivePlan['git'];
+  planningGitRoot: string | null;
+  blockers: ArchiveBlocker[];
+}> {
+  // The Foundation root anchors archive/spec paths, but a nested workspace
+  // can own its own Git repository. Planning and revalidation must use that repo.
+  const planningWorkspace = path.join(planningRoot, 'rasen');
+  let planningGitRoot: string | null = null;
   const blockers: ArchiveBlocker[] = [];
   const git: ArchivePlan['git'] = {
     execution: { state: 'error', codeCommit: null },
@@ -2374,13 +2382,16 @@ async function resolveArchiveGitPlan(
     blockers.push(blocker('git', executionRoot, error));
   }
   try {
-    const state = await adapters.git.state(planningRoot);
+    const state = await adapters.git.state(planningWorkspace);
     if (state === 'non-git') {
       git.planning = { state, branch: null, treeState: 'clean' };
     } else {
+      planningGitRoot = await adapters.git.exec(planningWorkspace, [
+        'rev-parse', '--show-toplevel',
+      ]);
       const [branchValue, status] = await Promise.all([
-        adapters.git.exec(planningRoot, ['rev-parse', '--abbrev-ref', 'HEAD']),
-        adapters.git.exec(planningRoot, ['status', '--porcelain']),
+        adapters.git.exec(planningGitRoot, ['rev-parse', '--abbrev-ref', 'HEAD']),
+        adapters.git.exec(planningGitRoot, ['status', '--porcelain']),
       ]);
       git.planning = {
         state,
@@ -2389,9 +2400,9 @@ async function resolveArchiveGitPlan(
       };
     }
   } catch (error) {
-    blockers.push(blocker('git', planningRoot, error));
+    blockers.push(blocker('git', planningWorkspace, error));
   }
-  return { git, blockers };
+  return { git, planningGitRoot, blockers };
 }
 
 function archiveDeltaSourcesFromFingerprint(
@@ -10383,7 +10394,9 @@ async function revalidateArchiveGitPlan(
     plan.roots.execution,
     adapters
   );
-  if (recoveryOwned && actual.git.planning.state === 'git') {
+  if (recoveryOwned && actual.planningGitRoot !== null) {
+    const planningGitRoot = actual.planningGitRoot;
+    const foundationRoot = await adapters.fs.realpath(plan.roots.planning);
     const excluded = [
       plan.paths.active,
       plan.paths.stage,
@@ -10406,12 +10419,15 @@ async function revalidateArchiveGitPlan(
         );
       }),
     ]
-      .filter(candidate => isArchiveContainedPath(plan.roots.planning, candidate))
       .map(candidate =>
-        normalizeRelative(path.relative(plan.roots.planning, candidate))
+        path.resolve(foundationRoot, path.relative(plan.roots.planning, candidate))
+      )
+      .filter(candidate => isArchiveContainedPath(planningGitRoot, candidate))
+      .map(candidate =>
+        normalizeRelative(path.relative(planningGitRoot, candidate))
       )
       .filter(relative => relative.length > 0);
-    const status = await adapters.git.exec(plan.roots.planning, [
+    const status = await adapters.git.exec(planningGitRoot, [
       'status',
       '--porcelain',
       '--',

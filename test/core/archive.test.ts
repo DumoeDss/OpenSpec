@@ -2148,6 +2148,112 @@ The system SHALL do the thing differently.
       return changeDir;
     }
 
+    interface PlanningProvenanceCase {
+      scenario: string;
+      dirtyFiles: string[];
+      planningTreeState: 'clean' | 'dirty';
+    }
+
+    const planningProvenanceCases: PlanningProvenanceCase[] = [
+      {
+        scenario: 'both repositories are clean',
+        dirtyFiles: [],
+        planningTreeState: 'clean',
+      },
+      {
+        scenario: 'only planning is dirty',
+        dirtyFiles: [path.join('rasen', 'dirty.txt')],
+        planningTreeState: 'dirty',
+      },
+      {
+        scenario: 'only the product is dirty',
+        dirtyFiles: ['dirty.txt'],
+        planningTreeState: 'clean',
+      },
+      {
+        scenario: 'only the active change is dirty',
+        dirtyFiles: [path.join('rasen', 'changes', 'nested-provenance', 'notes.txt')],
+        planningTreeState: 'dirty',
+      },
+    ];
+
+    it.each(planningProvenanceCases)(
+      'keeps nested planning Git provenance separate when $scenario',
+      async ({ dirtyFiles, planningTreeState }) => {
+        setUpGitRepo();
+        await fs.writeFile(path.join(tempDir, '.gitignore'), 'rasen/\n.rasen/\nxdg-data/\n');
+        execFileSync('git', ['checkout', '-b', 'product-branch'], { cwd: tempDir });
+        commitAll('initial product');
+        const codeCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
+          cwd: tempDir, encoding: 'utf8',
+        }).trim();
+        const planningHome = path.join(tempDir, 'rasen');
+        execFileSync('git', ['init', '-b', 'planning-main'], { cwd: planningHome });
+        const changeName = 'nested-provenance';
+        const changeDir = await seedChange(changeName);
+        await fs.writeFile(
+          path.join(changeDir, 'ship-log.md'),
+          `# Ship Log\n\n**Mode:** local\n**Commit:** ${codeCommit}\n`
+        );
+        execFileSync('git', ['add', 'changes'], { cwd: planningHome });
+        execFileSync('git', ['commit', '-m', 'initial planning'], { cwd: planningHome });
+        for (const dirtyFile of dirtyFiles) {
+          await fs.writeFile(path.join(tempDir, dirtyFile), 'uncommitted\n');
+        }
+
+        await archiveCommand.execute(changeName, {
+          dryRun: true, savePlan: true, yes: true, json: true,
+        });
+        const preview = parseLoggedArchive();
+        expect(preview.archive.plan.git.planning.branch).toBe('planning-main');
+        expect(preview.archive.plan.git.planning.treeState).toBe(planningTreeState);
+        expect(preview.archive.plan.git.execution.codeCommit).toBe(codeCommit);
+
+        class InterruptedArchiveCommand extends ArchiveCommand {
+          protected override applyPlannedArchive(
+            plan: ArchivePlan,
+            options: ArchiveApplyOptions = {}
+          ): Promise<ArchiveApplyResult> {
+            return applyArchive(plan, {
+              ...options,
+              adapters: {
+                ...defaultArchiveEngineAdapters,
+                fs: {
+                  ...defaultArchiveEngineAdapters.fs,
+                  copyFile: async () => {
+                    throw Object.assign(new Error('interrupted payload copy'), { code: 'EIO' });
+                  },
+                },
+              },
+            });
+          }
+        }
+
+        vi.mocked(console.log).mockClear();
+        await new InterruptedArchiveCommand().execute(undefined, {
+          applyPlan: preview.archive.planToken, yes: true, json: true,
+        });
+        const interrupted = parseLoggedArchive();
+        expect(interrupted.archive.result.status).toBe('recoverable');
+        expect(interrupted.archive.result.blockers).toContainEqual(
+          expect.objectContaining({ code: 'EIO', message: 'interrupted payload copy' })
+        );
+
+        vi.mocked(console.log).mockClear();
+        await archiveCommand.execute(undefined, {
+          applyPlan: preview.archive.planToken, yes: true, json: true,
+        });
+        const applied = parseLoggedArchive();
+        expect(applied.archive.result.status, JSON.stringify(applied.archive.result)).toBe('complete');
+        const accounting = JSON.parse(
+          await fs.readFile(path.join(applied.archive.result.path, 'archive.json'), 'utf8')
+        );
+        expect(accounting.planningBranch).toBe('planning-main');
+        expect(accounting.planningTreeState).toBe(planningTreeState);
+        expect(accounting.codeCommit).toBe(codeCommit);
+      }
+    );
+
     it('a config still carrying destination: external still archives in-repo', async () => {
       await writeConfig('schema: spec-driven\narchive:\n  destination: external\n');
       setUpGitRepo();
