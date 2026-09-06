@@ -1,5 +1,3 @@
-> LEAD final-gate update: the point-in-time CI limitation recorded below was closed by run `34029988895`, attempt 2, at the same source head `1f9ee439eeeb4eff6596a77f8f0f614bfcabf30b`. No product or timeout changes followed this review. See `review-cycle-report.md` for the final CI disposition; the independent source verdict below is unchanged.
-
 # PR #189 — capabilities review, round 2
 
 No findings.

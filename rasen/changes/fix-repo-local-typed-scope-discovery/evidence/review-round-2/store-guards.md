@@ -1,5 +1,3 @@
-> LEAD final-gate update: the point-in-time CI limitation recorded below was closed by run `34029988895`, attempt 2, at the same source head `1f9ee439eeeb4eff6596a77f8f0f614bfcabf30b`. No product or timeout changes followed this review. See `../review-cycle-report.md` for the final CI disposition; the independent source verdict below is unchanged.
-
 No findings.
 
 **WIN-01 は source repair と native Windows の元 failing case の pass を非著者として照合し、closed。SG-001／SG-002 も closed。新規 fix-delta findings は 0。** ただし PR 全体の CI gate は別件の Windows timeout により未完了であり、最終 CLEAN／all-CI pass は認定しない。
